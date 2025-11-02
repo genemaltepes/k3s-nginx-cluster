@@ -1,0 +1,49 @@
+all:
+  vars:
+    ansible_user: ansible
+    ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+    ansible_python_interpreter: /usr/bin/python3
+    k3s_version: v1.33.5+k3s1
+    vip_address: 192.168.1.200
+    
+  children:
+    masters:
+      hosts:
+        master1:
+          ansible_host: 192.168.1.211
+          node_ip: 192.168.1.211
+        master2:
+          ansible_host: 192.168.1.212
+          node_ip: 192.168.1.212
+        master3:
+          ansible_host: 192.168.1.213
+          node_ip: 192.168.1.213
+      vars:
+        node_type: master
+        
+    workers:
+      hosts:
+        worker1:
+          ansible_host: 192.168.1.221
+          node_ip: 192.168.1.221
+        worker2:
+          ansible_host: 192.168.1.222
+          node_ip: 192.168.1.222
+        worker3:
+          ansible_host: 192.168.1.223
+          node_ip: 192.168.1.223
+      vars:
+        node_type: worker
+        
+    k3s_cluster:
+      children:
+        masters:
+        workers:
+        
+    loadbalancer:
+      hosts:
+        lb1:
+          ansible_host: 192.168.1.210
+          node_ip: 192.168.1.210
+      vars:
+        priority: 100

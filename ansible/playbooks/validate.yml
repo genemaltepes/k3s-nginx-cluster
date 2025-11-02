@@ -1,0 +1,444 @@
+---
+- name: Validate K3S HA Cluster
+  hosts: masters[0]
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    k3s_kubeconfig: /etc/rancher/k3s/k3s.yaml
+    expected_masters: 3
+    expected_workers: 3
+    k3s_db_user: k3s
+    k3s_db_password: K3sSecurePassword123!
+    k3s_db_name: k3s
+    
+  tasks:
+    # Basic K3S Service Check
+    - name: Check K3S service is running
+      systemd:
+        name: k3s
+      register: k3s_service
+      failed_when: k3s_service.status.ActiveState != 'active'
+    
+    - name: Display K3S service status
+      debug:
+        msg: "✅ K3S service is {{ k3s_service.status.ActiveState }}"
+    
+    # Version Information
+    - name: Get K3S version
+      shell: /usr/local/bin/k3s --version | head -1
+      register: k3s_version_output
+      changed_when: false
+    
+    - name: Get Kubernetes API version
+      shell: /usr/local/bin/k3s kubectl version --output=json
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: k8s_version_json
+      changed_when: false
+      failed_when: false
+    
+    - name: Extract Kubernetes server version
+      set_fact:
+        k8s_server_version: "{{ (k8s_version_json.stdout | from_json).serverVersion.gitVersion }}"
+      when: 
+        - k8s_version_json.rc == 0
+        - k8s_version_json.stdout | length > 0
+    
+    # Node Validation
+    - name: Get all nodes
+      shell: /usr/local/bin/k3s kubectl get nodes --no-headers
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: all_nodes_raw
+      changed_when: false
+    
+    - name: Get detailed node information
+      shell: /usr/local/bin/k3s kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: nodes_detailed
+      changed_when: false
+    
+    - name: Count master nodes
+      shell: /usr/local/bin/k3s kubectl get nodes --selector='node-role.kubernetes.io/control-plane' --no-headers | wc -l
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: master_count
+      changed_when: false
+    
+    - name: Count worker nodes
+      shell: /usr/local/bin/k3s kubectl get nodes --selector='!node-role.kubernetes.io/control-plane' --no-headers | wc -l
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: worker_count
+      changed_when: false
+    
+    - name: Check all nodes are Ready
+      shell: /usr/local/bin/k3s kubectl get nodes --no-headers | grep -v " Ready " | wc -l
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: not_ready_nodes
+      changed_when: false
+    
+    - name: Get list of NotReady nodes
+      shell: /usr/local/bin/k3s kubectl get nodes --no-headers | grep -v " Ready " | awk '{print $1}'
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: not_ready_list
+      changed_when: false
+      when: not_ready_nodes.stdout | int > 0
+    
+    - name: Validate master count
+      assert:
+        that:
+          - master_count.stdout | int == expected_masters
+        fail_msg: "Expected {{ expected_masters }} masters, found {{ master_count.stdout }}"
+        success_msg: "✅ Master count correct: {{ master_count.stdout }}"
+    
+    - name: Validate worker count
+      assert:
+        that:
+          - worker_count.stdout | int == expected_workers
+        fail_msg: "Expected {{ expected_workers }} workers, found {{ worker_count.stdout }}"
+        success_msg: "✅ Worker count correct: {{ worker_count.stdout }}"
+    
+    - name: Validate all nodes are Ready
+      assert:
+        that:
+          - not_ready_nodes.stdout | int == 0
+        fail_msg: "Not all nodes are Ready. NotReady nodes: {{ not_ready_list.stdout_lines | default([]) | join(', ') }}"
+        success_msg: "✅ All nodes are Ready"
+    
+    # Pod Health Check
+    - name: Get all pods in kube-system
+      shell: /usr/local/bin/k3s kubectl get pods -n kube-system
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: system_pods
+      changed_when: false
+    
+    - name: Count running pods in kube-system
+      shell: /usr/local/bin/k3s kubectl get pods -n kube-system --field-selector=status.phase=Running --no-headers | wc -l
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: running_pods_count
+      changed_when: false
+    
+    - name: Count total pods in kube-system
+      shell: /usr/local/bin/k3s kubectl get pods -n kube-system --no-headers | wc -l
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: total_pods_count
+      changed_when: false
+    
+    - name: Get non-running pods
+      shell: /usr/local/bin/k3s kubectl get pods -n kube-system --field-selector=status.phase!=Running --no-headers
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: non_running_pods
+      changed_when: false
+      failed_when: false
+    
+    # Cluster Info
+    - name: Get cluster info
+      shell: /usr/local/bin/k3s kubectl cluster-info
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: cluster_info
+      changed_when: false
+    
+    # VIP Validation
+    - name: Test VIP accessibility
+      shell: curl -k -m 5 https://{{ vip_address }}:6443/ping
+      register: vip_ping_test
+      changed_when: false
+      failed_when: false
+    
+    - name: Validate VIP is responding
+      assert:
+        that:
+          - "'pong' in vip_ping_test.stdout"
+        fail_msg: "VIP {{ vip_address }} not responding to /ping endpoint"
+        success_msg: "✅ VIP {{ vip_address }} is responding"
+    
+    # Storage Validation
+    - name: Get storage classes
+      shell: /usr/local/bin/k3s kubectl get storageclass
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: storage_classes
+      changed_when: false
+      failed_when: false
+    
+    - name: Count storage classes
+      shell: /usr/local/bin/k3s kubectl get storageclass --no-headers | wc -l
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: storage_class_count
+      changed_when: false
+      when: storage_classes.rc == 0
+    
+    - name: Check for default storage class
+      shell: |
+        /usr/local/bin/k3s kubectl get storageclass | \
+        grep "(default)" | awk '{print $1}'
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: default_storage_class
+      changed_when: false
+      failed_when: false
+      when: storage_classes.rc == 0    
+
+    # NFS CSI Driver Check
+    - name: Check NFS CSI controller
+      shell: /usr/local/bin/k3s kubectl get deployment csi-nfs-controller -n kube-system
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: nfs_csi_controller
+      changed_when: false
+      failed_when: false
+    
+    - name: Check NFS CSI node pods
+      shell: /usr/local/bin/k3s kubectl get daemonset csi-nfs-node -n kube-system
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: nfs_csi_node
+      changed_when: false
+      failed_when: false
+    
+    # Database Connection Check (from masters)
+    - name: Check database connectivity from master
+      shell: |
+        PGPASSWORD='{{ k3s_db_password }}' psql -h {{ hostvars[groups['database'][0]].ansible_host }} \
+          -U {{ k3s_db_user }} -d {{ k3s_db_name }} -c '\l' -t
+      register: db_connection_test
+      changed_when: false
+      failed_when: false
+      when: groups['database'] is defined and groups['database'] | length > 0
+    
+    # Networking Validation
+    - name: Check API server health endpoint
+      shell: curl -k -m 5 https://127.0.0.1:6443/healthz
+      register: apiserver_health
+      changed_when: false
+      failed_when: false
+
+    - name: Check CoreDNS deployment
+      shell: |
+        /usr/local/bin/k3s kubectl get deployment -n kube-system coredns \
+          -o jsonpath='{.status.availableReplicas}'
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: coredns_replicas
+      changed_when: false
+      failed_when: false
+
+    - name: Check Kubernetes service endpoints
+      shell: |
+        /usr/local/bin/k3s kubectl get endpoints kubernetes \
+          -o jsonpath='{.subsets[*].addresses[*].ip}' | wc -w
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: kubernetes_endpoints
+      changed_when: false
+
+    - name: Check cluster networking (service CIDR)
+      shell: |
+        /usr/local/bin/k3s kubectl get service kubernetes \
+          -o jsonpath='{.spec.clusterIP}'
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: service_cidr_test
+      changed_when: false
+
+    - name: Set networking health status
+      set_fact:
+        apiserver_healthy: "{{ apiserver_health.stdout == 'ok' }}"
+        coredns_healthy: "{{ coredns_replicas.stdout | int > 0 }}"
+        endpoints_healthy: "{{ kubernetes_endpoints.stdout | int > 0 }}"
+        networking_healthy: "{{ apiserver_health.stdout == 'ok' and coredns_replicas.stdout | int > 0 and kubernetes_endpoints.stdout | int > 0 }}"
+
+    - name: Display networking details
+      debug:
+        msg: |
+          Networking Status:
+            API Server: {{ 'Healthy' if apiserver_healthy else 'Unhealthy' }}
+            CoreDNS: {{ coredns_replicas.stdout }} replicas available
+            Endpoints: {{ kubernetes_endpoints.stdout }} IPs
+            Overall: {{ 'OK' if networking_healthy else 'Issues Detected' }}    
+
+    # Get events for troubleshooting
+    - name: Get recent cluster events
+      shell: /usr/local/bin/k3s kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -20
+      environment:
+        KUBECONFIG: "{{ k3s_kubeconfig }}"
+      register: recent_events
+      changed_when: false
+    
+    # Summary Report
+    - name: Display validation summary
+      debug:
+        msg: |
+          
+          ╔════════════════════════════════════════════════════════════════╗
+          ║           K3S High-Availability Cluster Validation             ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ Overall Status: {{ '✅ HEALTHY' if (master_count.stdout | int == expected_masters and worker_count.stdout | int == expected_workers and not_ready_nodes.stdout | int == 0 and 'pong' in vip_ping_test.stdout) else '⚠️  ISSUES DETECTED' }} ║
+          ║                                                                ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║ Version Information:                                           ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ K3S Version: {{ k3s_version_output.stdout | regex_replace('k3s version ', '') | regex_replace(' .*', '') }} ║
+          ║ Kubernetes:  {{ k8s_server_version | default('N/A') }}        ║
+          ║                                                                ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║ Node Summary:                                                  ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ {{ '✅' if master_count.stdout | int == expected_masters else '❌' }} Master Nodes: {{ master_count.stdout }}/{{ expected_masters }} ({{ 'OK' if master_count.stdout | int == expected_masters else 'MISMATCH' }}) ║
+          ║ {{ '✅' if worker_count.stdout | int == expected_workers else '❌' }} Worker Nodes: {{ worker_count.stdout }}/{{ expected_workers }} ({{ 'OK' if worker_count.stdout | int == expected_workers else 'MISMATCH' }}) ║
+          ║ {{ '✅' if not_ready_nodes.stdout | int == 0 else '❌' }} Node Status:  {{ 'All Ready' if not_ready_nodes.stdout | int == 0 else not_ready_nodes.stdout + ' NotReady' }} ║
+          ║                                                                ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║ System Pods (kube-system):                                     ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ {{ '✅' if running_pods_count.stdout | int == total_pods_count.stdout | int else '⚠️ ' }} Running: {{ running_pods_count.stdout }}/{{ total_pods_count.stdout }} ║
+          ║                                                                ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║ Networking:                                                    ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ {{ '✅' if 'pong' in vip_ping_test.stdout else '❌' }} VIP: {{ vip_address }} ({{ 'Responding' if 'pong' in vip_ping_test.stdout else 'Not Responding' }}) ║
+          ║ {{ '✅' if apiserver_healthy | default(false) else '❌' }} API Server: {{ 'Healthy' if apiserver_healthy | default(false) else 'Unhealthy' }} ║
+          ║ {{ '✅' if coredns_healthy | default(false) else '❌' }} CoreDNS: {{ coredns_replicas.stdout | default('0') }} replicas available ║
+          ║ {{ '✅' if endpoints_healthy | default(false) else '❌' }} Endpoints: {{ 'OK' if endpoints_healthy | default(false) else 'Failed' }} ║
+          ║                                                                ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║ Storage:                                                       ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ {{ '✅' if storage_classes.rc == 0 else '⚠️ ' }} StorageClasses: {{ storage_class_count.stdout if storage_classes.rc == 0 else '0' }} available ║
+          ║ {{ '✅' if default_storage_class.stdout | length > 0 else '⚠️ ' }} Default SC: {{ default_storage_class.stdout if default_storage_class.stdout | length > 0 else 'Not Set' }} ║
+          ║ {{ '✅' if nfs_csi_controller.rc == 0 else '⚠️ ' }} NFS CSI Driver: {{ 'Installed' if nfs_csi_controller.rc == 0 else 'Not Installed' }} ║
+          ║                                                                ║
+          {% if groups['database'] is defined and groups['database'] | length > 0 %}
+          ╠════════════════════════════════════════════════════════════════╣
+          ║ Database:                                                      ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ {{ '✅' if db_connection_test.rc == 0 else '❌' }} PostgreSQL: {{ 'Connected' if db_connection_test.rc == 0 else 'Connection Failed' }} ║
+          ║                                                                ║
+          {% endif %}
+          ╚════════════════════════════════════════════════════════════════╝
+    
+    - name: Display detailed node information
+      debug:
+        msg: |
+          
+          ═══════════════════════════════════════════════════════════════
+          Node Details:
+          ═══════════════════════════════════════════════════════════════
+          
+          {{ nodes_detailed.stdout }}
+    
+    - name: Display system pods status
+      debug:
+        msg: |
+          
+          ═══════════════════════════════════════════════════════════════
+          System Pods (kube-system):
+          ═══════════════════════════════════════════════════════════════
+          
+          {{ system_pods.stdout }}
+      when: system_pods.stdout | length > 0
+    
+    - name: Display non-running pods warning
+      debug:
+        msg: |
+          
+          ⚠️  WARNING: Non-running pods detected:
+          
+          {{ non_running_pods.stdout }}
+      when: 
+        - non_running_pods.stdout | length > 0
+        - non_running_pods.rc == 0
+    
+    - name: Display storage information
+      debug:
+        msg: |
+          
+          ═══════════════════════════════════════════════════════════════
+          Storage Classes:
+          ═══════════════════════════════════════════════════════════════
+          
+          {{ storage_classes.stdout }}
+      when: storage_classes.rc == 0
+    
+    - name: Display recent events
+      debug:
+        msg: |
+          
+          ═══════════════════════════════════════════════════════════════
+          Recent Cluster Events (Last 20):
+          ═══════════════════════════════════════════════════════════════
+          
+          {{ recent_events.stdout }}
+      when: recent_events.stdout | length > 0
+    
+    - name: Display verification commands
+      debug:
+        msg: |
+          
+          ╔════════════════════════════════════════════════════════════════╗
+          ║              Useful Verification Commands                      ║
+          ╠════════════════════════════════════════════════════════════════╣
+          ║                                                                ║
+          ║ Check nodes:                                                   ║
+          ║   kubectl get nodes -o wide                                    ║
+          ║                                                                ║
+          ║ Check system pods:                                             ║
+          ║   kubectl get pods -n kube-system                              ║
+          ║                                                                ║
+          ║ Check all pods:                                                ║
+          ║   kubectl get pods -A                                          ║
+          ║                                                                ║
+          ║ Check storage:                                                 ║
+          ║   kubectl get storageclass                                     ║
+          ║   kubectl get pv,pvc -A                                        ║
+          ║                                                                ║
+          ║ View logs:                                                     ║
+          ║   kubectl logs -n kube-system <pod-name>                       ║
+          ║                                                                ║
+          ║ Test VIP:                                                      ║
+          ║   curl -k https://{{ vip_address }}:6443/ping                 ║
+          ║                                                                ║
+          ║ Check cluster health:                                          ║
+          ║   kubectl get cs                                               ║
+          ║   kubectl cluster-info                                         ║
+          ║                                                                ║
+          ╚════════════════════════════════════════════════════════════════╝
+    
+    # Final assertions
+    - name: Final validation check
+      assert:
+        that:
+          - master_count.stdout | int == expected_masters
+          - worker_count.stdout | int == expected_workers
+          - not_ready_nodes.stdout | int == 0
+          - "'pong' in vip_ping_test.stdout"
+          - running_pods_count.stdout | int == total_pods_count.stdout | int
+        fail_msg: |
+          ❌ Cluster validation failed. Please review the detailed output above.
+        success_msg: |
+          
+          ╔════════════════════════════════════════════════════════════════╗
+          ║                                                                ║
+          ║              ✅ CLUSTER VALIDATION SUCCESSFUL ✅                ║
+          ║                                                                ║
+          ║  Your K3S High-Availability cluster is healthy and ready!     ║
+          ║                                                                ║
+          ╚════════════════════════════════════════════════════════════════╝

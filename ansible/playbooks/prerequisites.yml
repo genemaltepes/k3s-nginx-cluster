@@ -1,0 +1,104 @@
+---
+- name: Install Prerequisites on All Nodes
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        
+    - name: Install common packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - vim
+          - net-tools
+          - htop
+          - iptables
+          - ufw
+          - open-iscsi
+          - nfs-common
+          - python3
+          - python3-pip
+          - ca-certificates
+          - gnupg
+          - lsb-release
+        state: present
+        
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/swap/d' /etc/fstab
+      when: ansible_swaptotal_mb > 0
+      
+    - name: Load kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+        
+    - name: Ensure kernel modules load on boot
+      copy:
+        dest: /etc/modules-load.d/k3s.conf
+        content: |
+          overlay
+          br_netfilter
+          
+    - name: Configure sysctl for Kubernetes
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/k3s.conf
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+        - { key: 'vm.swappiness', value: '0' }
+        
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+        
+    - name: Update /etc/hosts with all nodes
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ item }}"
+        state: present
+      loop: "{{ groups['all'] }}"
+      
+    - name: Ensure time synchronization
+      apt:
+        name: systemd-timesyncd
+        state: present
+        
+    - name: Start and enable timesyncd
+      systemd:
+        name: systemd-timesyncd
+        state: started
+        enabled: yes
+        
+    - name: Configure firewall rules for K3S
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "6443"   # K3S API
+        - "10250"  # Kubelet
+        - "2379"   # etcd client
+        - "2380"   # etcd peer
+      when: inventory_hostname in groups['k3s_cluster']

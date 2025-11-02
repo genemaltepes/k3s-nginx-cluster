@@ -1,0 +1,197 @@
+---
+- name: Deploy K3S Master Nodes
+  hosts: masters
+  become: yes
+  gather_facts: yes
+  serial: 1  # Deploy masters one at a time
+  
+  vars:
+    k3s_token_file: "/var/lib/rancher/k3s/server/node-token"
+    
+  tasks:
+    - name: Check if K3S is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+      
+    - name: Read existing K3S token if available
+      slurp:
+        src: "{{ k3s_token_file }}"
+      register: existing_token
+      when: k3s_binary.stat.exists
+      ignore_errors: yes
+      
+    - name: Set K3S token from first master
+      set_fact:
+        k3s_token: "{{ hostvars[groups['masters'][0]].k3s_server_token | default('') }}"
+      when: inventory_hostname != groups['masters'][0]
+      
+    # Install first master with embedded etcd
+    - name: Install K3S on first master
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="{{ k3s_version }}" \
+        sh -s - server \
+          --cluster-init \
+          --tls-san="{{ vip_address }}" \
+          --tls-san="{{ ansible_host }}" \
+          --node-ip="{{ ansible_host }}" \
+          --advertise-address="{{ ansible_host }}" \
+          --disable=traefik \
+          --disable=servicelb \
+          --write-kubeconfig-mode=644
+      when: 
+        - inventory_hostname == groups['masters'][0]
+        - not k3s_binary.stat.exists
+      register: first_master_install
+      
+    - name: Wait for K3S to be ready on first master
+      wait_for:
+        path: "{{ k3s_token_file }}"
+        timeout: 120
+      when: inventory_hostname == groups['masters'][0]
+      
+    - name: Get K3S token from first master
+      slurp:
+        src: "{{ k3s_token_file }}"
+      register: k3s_token_raw
+      when: inventory_hostname == groups['masters'][0]
+      
+    - name: Set K3S token fact on first master
+      set_fact:
+        k3s_server_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+      when: inventory_hostname == groups['masters'][0]
+      
+    - name: Save K3S token to localhost
+      copy:
+        content: "{{ hostvars[groups['masters'][0]].k3s_server_token }}"
+        dest: /tmp/k3s-server-token
+        mode: '0600'
+      delegate_to: localhost
+      become: no
+      when: inventory_hostname == groups['masters'][0]
+      run_once: yes
+      
+    - name: Wait for first master API to be available
+      uri:
+        url: "https://{{ hostvars[groups['masters'][0]].ansible_host }}:6443/ping"
+        validate_certs: no
+        status_code: 200
+      register: api_result
+      until: api_result.status == 200
+      retries: 30
+      delay: 10
+      when: inventory_hostname == groups['masters'][0]
+      
+    # Install additional masters with embedded etcd
+    - name: Read K3S token from localhost for additional masters
+      set_fact:
+        k3s_server_token: "{{ lookup('file', '/tmp/k3s-server-token') }}"
+      when: inventory_hostname != groups['masters'][0]
+      
+    - name: Install K3S on additional masters
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="{{ k3s_version }}" \
+        K3S_TOKEN="{{ k3s_server_token }}" \
+        sh -s - server \
+          --server https://{{ hostvars[groups['masters'][0]].ansible_host }}:6443 \
+          --tls-san="{{ vip_address }}" \
+          --tls-san="{{ ansible_host }}" \
+          --node-ip="{{ ansible_host }}" \
+          --advertise-address="{{ ansible_host }}" \
+          --disable=traefik \
+          --disable=servicelb \
+          --write-kubeconfig-mode=644
+      when:
+        - inventory_hostname != groups['masters'][0]
+        - not k3s_binary.stat.exists
+        
+    - name: Wait for K3S to be ready
+      wait_for:
+        port: 6443
+        timeout: 120
+        
+    - name: Verify K3S service is running
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+        
+    - name: Label master nodes
+      shell: |
+        /usr/local/bin/k3s kubectl label node {{ inventory_hostname }} node-role.kubernetes.io/master=true --overwrite
+      when: inventory_hostname == groups['masters'][0]
+      
+- name: Configure kubectl access
+  hosts: masters[0]
+  become: yes
+  
+  tasks:
+    - name: Ensure kubeconfig exists and is readable
+      file:
+        path: /etc/rancher/k3s/k3s.yaml
+        mode: '0644'
+      register: kubeconfig_check
+      
+    - name: Verify kubeconfig has content
+      stat:
+        path: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_stat
+      
+    - name: Fail if kubeconfig doesn't exist
+      fail:
+        msg: "Kubeconfig not found at /etc/rancher/k3s/k3s.yaml - K3S may not have started properly"
+      when: not kubeconfig_stat.stat.exists
+    
+    - name: Fetch kubeconfig to localhost
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /tmp/k3s-kubeconfig.yaml
+        flat: yes
+        
+    - name: Update kubeconfig with VIP address
+      replace:
+        path: /tmp/k3s-kubeconfig.yaml
+        regexp: 'https://127\.0\.0\.1:6443'
+        replace: 'https://{{ vip_address }}:6443'
+      delegate_to: localhost
+      become: no
+      
+    - name: Create .kube directory on localhost
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.kube"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      
+    - name: Copy kubeconfig to user home
+      copy:
+        src: /tmp/k3s-kubeconfig.yaml
+        dest: "{{ lookup('env', 'HOME') }}/.kube/config"
+        mode: '0600'
+      delegate_to: localhost
+      become: no
+      
+    - name: Display master nodes status
+      shell: /usr/local/bin/k3s kubectl get nodes -o wide
+      register: nodes_status
+      changed_when: false
+      
+    - name: Show cluster status
+      debug:
+        msg: "{{ nodes_status.stdout_lines }}"
+        
+    - name: Display success message
+      debug:
+        msg: |
+          ✅ Kubeconfig successfully configured!
+          
+          Location: {{ lookup('env', 'HOME') }}/.kube/config
+          VIP Address: {{ vip_address }}
+          
+          Test from your workstation:
+            kubectl get nodes
+            kubectl get pods -A
+            kubectl cluster-info

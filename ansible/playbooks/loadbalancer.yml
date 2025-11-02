@@ -1,0 +1,242 @@
+---
+- name: Setup Nginx Load Balancer with Keepalived
+  hosts: loadbalancer
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    vip_interface: "eth0"
+    nginx_stats_port: 8080
+    
+  tasks:
+    - name: Install Nginx and Keepalived
+      apt:
+        name:
+          - nginx
+          - keepalived
+          - libnginx-mod-stream
+        state: present
+        update_cache: yes
+        
+    - name: Remove default Nginx configuration
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+        
+    - name: Configure Nginx for stream (TCP/UDP) load balancing
+      copy:
+        dest: /etc/nginx/nginx.conf
+        content: |
+          user www-data;
+          worker_processes auto;
+          pid /run/nginx.pid;
+          include /etc/nginx/modules-enabled/*.conf;
+          
+          events {
+              worker_connections 768;
+              # multi_accept on;
+          }
+          
+          # HTTP block for status page
+          http {
+              sendfile on;
+              tcp_nopush on;
+              types_hash_max_size 2048;
+              
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              
+              access_log /var/log/nginx/access.log;
+              error_log /var/log/nginx/error.log;
+              
+              # Status page
+              server {
+                  listen {{ nginx_stats_port }};
+                  location /status {
+                      stub_status on;
+                      access_log off;
+                  }
+                  location / {
+                      return 200 "Nginx Load Balancer Status OK\n";
+                      add_header Content-Type text/plain;
+                  }
+              }
+          }
+          
+          # Stream block for TCP load balancing
+          stream {
+              log_format basic '$remote_addr [$time_local] '
+                               '$protocol $status $bytes_sent $bytes_received '
+                               '$session_time "$upstream_addr" '
+                               '"$upstream_bytes_sent" "$upstream_bytes_received" "$upstream_connect_time"';
+              
+              access_log /var/log/nginx/stream-access.log basic;
+              error_log /var/log/nginx/stream-error.log;
+              
+              # K3S API Server (6443)
+              upstream k3s_api {
+                  {% for host in groups['masters'] %}
+                  server {{ hostvars[host].ansible_host }}:6443 max_fails=3 fail_timeout=10s;
+                  {% endfor %}
+              }
+              
+              server {
+                  listen {{ vip_address }}:6443;
+                  proxy_pass k3s_api;
+                  proxy_timeout 300s;
+                  proxy_connect_timeout 5s;
+              }
+              
+              # HTTP Ingress (80)
+              upstream http_ingress {
+                  {% for host in groups['workers'] %}
+                  server {{ hostvars[host].ansible_host }}:80 max_fails=3 fail_timeout=10s;
+                  {% endfor %}
+              }
+              
+              server {
+                  listen {{ vip_address }}:80;
+                  proxy_pass http_ingress;
+                  proxy_timeout 300s;
+                  proxy_connect_timeout 5s;
+              }
+              
+              # HTTPS Ingress (443)
+              upstream https_ingress {
+                  {% for host in groups['workers'] %}
+                  server {{ hostvars[host].ansible_host }}:443 max_fails=3 fail_timeout=10s;
+                  {% endfor %}
+              }
+              
+              server {
+                  listen {{ vip_address }}:443;
+                  proxy_pass https_ingress;
+                  proxy_timeout 300s;
+                  proxy_connect_timeout 5s;
+              }
+          }
+        mode: '0644'
+      notify: restart nginx
+      
+    - name: Configure Keepalived
+      copy:
+        dest: /etc/keepalived/keepalived.conf
+        content: |
+          vrrp_script chk_nginx {
+              script "/usr/bin/killall -0 nginx"
+              interval 2
+              weight 2
+          }
+          
+          vrrp_instance VI_1 {
+              state MASTER
+              interface {{ vip_interface }}
+              virtual_router_id 51
+              priority {{ priority | default(100) }}
+              advert_int 1
+              
+              authentication {
+                  auth_type PASS
+                  auth_pass K3sHA2024
+              }
+              
+              virtual_ipaddress {
+                  {{ vip_address }}/24
+              }
+              
+              track_script {
+                  chk_nginx
+              }
+          }
+        mode: '0644'
+      notify: restart keepalived
+      
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: yes
+        
+    - name: Enable non-local bind
+      sysctl:
+        name: net.ipv4.ip_nonlocal_bind
+        value: '1'
+        state: present
+        reload: yes
+        
+    - name: Ensure Nginx is started and enabled
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Ensure Keepalived is started and enabled
+      systemd:
+        name: keepalived
+        state: started
+        enabled: yes
+      register: keepalived_started
+
+    - name: Wait for Keepalived to assign VIP (if just started)
+      pause:
+        seconds: 5
+        prompt: "Waiting for Keepalived to negotiate and assign VIP..."
+      when: keepalived_started.changed
+
+    - name: Wait for Keepalived to stabilize (if already running)
+      pause:
+        seconds: 2
+      when: not keepalived_started.changed
+
+    - name: Check VIP assignment
+      shell: ip addr show | grep "{{ vip_address }}" || echo "VIP_NOT_FOUND"
+      register: vip_check
+      changed_when: false
+      retries: 3
+      delay: 2
+      until: "'VIP_NOT_FOUND' not in vip_check.stdout"
+
+    - name: Display VIP status
+      debug:
+        msg: |
+          {% if 'VIP_NOT_FOUND' not in vip_check.stdout %}
+          ✅ VIP {{ vip_address }} is configured
+          {{ vip_check.stdout }}
+          {% else %}
+          ❌ VIP {{ vip_address }} is NOT configured
+          {% endif %}
+
+    - name: Verify VIP is configured
+      assert:
+        that:
+          - "'VIP_NOT_FOUND' not in vip_check.stdout"
+        fail_msg: |
+          ❌ VIP {{ vip_address }} not found after {{ vip_check.attempts }} attempts
+          
+          Check Keepalived:
+            sudo systemctl status keepalived
+            sudo journalctl -xeu keepalived.service | tail -20
+            sudo cat /etc/keepalived/keepalived.conf
+        success_msg: "✅ VIP {{ vip_address }} successfully configured"
+
+    - name: Display load balancer information
+      debug:
+        msg: |
+          Nginx Load Balancer Setup Complete:
+          - VIP Address: {{ vip_address }}
+          - Nginx Status: http://{{ ansible_host }}:{{ nginx_stats_port }}/status
+          - Backends: K3S API (6443), HTTP (80), HTTPS (443)
+          - Keepalived running
+          Note: VIP port 6443 will respond after K3S masters are deployed in next phase.
+          
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+        
+    - name: restart keepalived
+      systemd:
+        name: keepalived
+        state: restarted

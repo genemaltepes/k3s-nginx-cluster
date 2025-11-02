@@ -1,0 +1,202 @@
+---
+- name: Verify and Configure Nginx for K3S
+  hosts: loadbalancer
+  become: yes
+  
+  tasks:
+    - name: Check Nginx service status
+      systemd:
+        name: nginx
+      register: nginx_service_status
+      failed_when: false
+    
+    - name: Stop Nginx before configuration
+      systemd:
+        name: nginx
+        state: stopped
+      failed_when: false
+    
+    - name: Check for duplicate K3S configurations
+      shell: grep -c "upstream k3s_api" /etc/nginx/nginx.conf || echo "0"
+      register: k3s_upstream_count
+      changed_when: false
+    
+    - name: Display duplicate check result
+      debug:
+        msg: "Found {{ k3s_upstream_count.stdout }} K3S upstream configuration(s)"
+    
+    - name: Backup Nginx config
+      copy:
+        src: /etc/nginx/nginx.conf
+        dest: /etc/nginx/nginx.conf.backup.{{ ansible_date_time.epoch }}
+        remote_src: yes
+    
+    - name: Validate Nginx configuration
+      command: nginx -t
+      register: nginx_validation
+      changed_when: false
+      failed_when: false
+    
+    - name: Display validation result
+      debug:
+        msg: "{{ nginx_validation.stderr_lines }}"
+    
+    - name: Fail if configuration invalid
+      fail:
+        msg: |
+          ❌ Nginx configuration is invalid!
+          
+          Error: {{ nginx_validation.stderr }}
+          
+          Check config manually:
+            sudo cat /etc/nginx/nginx.conf
+            sudo nginx -t
+      when: nginx_validation.rc != 0
+    
+    - name: Ensure Nginx is enabled
+      systemd:
+        name: nginx
+        enabled: yes
+    
+    - name: Start Nginx
+      systemd:
+        name: nginx
+        state: started
+      register: nginx_started
+    
+    - name: Wait for Nginx to initialize
+      pause:
+        seconds: 5
+    
+    - name: Check Nginx process is running
+      shell: pgrep nginx
+      register: nginx_process
+      failed_when: false
+      changed_when: false
+    
+    - name: Get Nginx status if not running
+      shell: systemctl status nginx --no-pager
+      register: nginx_status_detail
+      when: nginx_process.rc != 0
+      failed_when: false
+    
+    - name: Get Nginx logs if not running
+      shell: journalctl -xeu nginx.service --no-pager | tail -30
+      register: nginx_logs
+      when: nginx_process.rc != 0
+      failed_when: false
+    
+    - name: Display Nginx errors
+      debug:
+        msg: |
+          ❌ Nginx failed to start!
+          
+          Status:
+          {{ nginx_status_detail.stdout }}
+          
+          Recent Logs:
+          {{ nginx_logs.stdout }}
+      when: nginx_process.rc != 0
+    
+    - name: Fail if Nginx not running
+      fail:
+        msg: "Nginx process not running after start attempt"
+      when: nginx_process.rc != 0
+    
+    - name: Verify Nginx is listening on 6443
+      shell: ss -tlnp | grep ':6443'
+      register: nginx_listening
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: nginx_listening.rc == 0
+    
+    - name: Display listening status
+      debug:
+        msg: |
+          ✅ Nginx is listening on port 6443
+          {{ nginx_listening.stdout }}
+    
+    - name: Test VIP locally
+      shell: curl -k -m 5 https://{{ vip_address }}:6443/ping 2>&1
+      register: vip_test
+      failed_when: false
+      changed_when: false
+    
+    - name: Display VIP test result
+      debug:
+        msg: "{{ '✅ VIP responding: ' + vip_test.stdout if 'pong' in vip_test.stdout else '⚠️  VIP test result: ' + vip_test.stdout }}"
+    
+    - name: Verify VIP is working
+      fail:
+        msg: |
+          ❌ VIP not responding with 'pong'
+          
+          Result: {{ vip_test.stdout }}
+          
+          Check:
+            1. Masters running: ssh ansible@192.168.1.211 'sudo systemctl status k3s'
+            2. Master responding: ssh ansible@192.168.1.211 'curl -k https://127.0.0.1:6443/ping'
+      when: "'pong' not in vip_test.stdout"
+
+# Rest of playbook (master restart, etc.)
+- name: Restart K3S Masters
+  hosts: masters
+  become: yes
+  serial: 1
+  
+  tasks:
+    - name: Restart K3S service on masters
+      systemd:
+        name: k3s
+        state: restarted
+    
+    - name: Wait for K3S to be ready
+      wait_for:
+        port: 6443
+        delay: 5
+        timeout: 120
+    
+    - name: Verify K3S is running
+      systemd:
+        name: k3s
+        state: started
+    
+    - name: Check for errors in K3S logs
+      shell: journalctl -xeu k3s.service --since '30 seconds ago' | grep -iE '(error|fatal)' || echo 'No errors'
+      register: k3s_logs
+      changed_when: false
+    
+    - name: Display K3S status
+      debug:
+        msg: "{{ '✅ K3S restarted successfully' if 'No errors' in k3s_logs.stdout else '⚠️  Check logs: ' + k3s_logs.stdout }}"
+
+- name: Verify Cluster Health
+  hosts: masters[0]
+  become: yes
+  
+  tasks:
+    - name: Wait for all masters to be Ready
+      shell: /usr/local/bin/k3s kubectl get nodes --selector='node-role.kubernetes.io/control-plane' --no-headers | grep -c ' Ready '
+      register: ready_masters
+      retries: 10
+      delay: 10
+      until: ready_masters.stdout | int == groups['masters'] | length
+      changed_when: false
+    
+    - name: Get cluster nodes status
+      shell: /usr/local/bin/k3s kubectl get nodes -o wide
+      register: cluster_nodes
+      changed_when: false
+    
+    - name: Display cluster status
+      debug:
+        msg: |
+          ✅ Cluster Health Check Complete
+          
+          {{ cluster_nodes.stdout }}
+          
+          Ready Masters: {{ ready_masters.stdout }}/{{ groups['masters'] | length }}
+          Nginx VIP: {{ vip_address }}:6443
+          
+          ✅ Ready to deploy workers!

@@ -1,0 +1,40 @@
+---
+- name: K3S HA Cluster Deployment
+  hosts: all
+  gather_facts: yes
+  become: yes
+  
+  tasks:
+    - name: Display deployment banner
+      debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════════╗
+          ║     K3S HA Cluster Deployment Starting                ║
+          ║     Version: {{ k3s_version }}                        ║
+          ║     VIP: {{ vip_address }}                            ║
+          ║     Datastore: Embedded etcd                          ║
+          ╚═══════════════════════════════════════════════════════╝
+
+# Phase 1: Prerequisites on all nodes
+- name: Phase 1 - Install Prerequisites
+  import_playbook: playbooks/prerequisites.yml
+
+# Phase 2: Setup load balancer
+- name: Phase 2 - Setup Nginx Load Balancer
+  import_playbook: playbooks/loadbalancer.yml
+
+# Phase 3: Deploy K3S master nodes
+- name: Phase 3 - Deploy K3S Masters
+  import_playbook: playbooks/k3s-masters.yml
+
+# Phase 4: Verify Nginx and Restart Masters
+- name: Phase 4 - Verify Nginx and Restart Masters
+  import_playbook: playbooks/verify-nginx-k3s.yml
+
+# Phase 5: Deploy K3S worker nodes
+- name: Phase 5 - Deploy K3S Workers
+  import_playbook: playbooks/k3s-workers.yml
+
+# Phase 6: Post-deployment validation
+- name: Phase 6 - Validate Deployment
+  import_playbook: playbooks/validate.yml
